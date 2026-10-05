@@ -1,36 +1,38 @@
 package waitgroup
 
 import (
+	"math"
 	"sync/atomic"
+
 	"primitives/internal/futex"
 )
 
 type WaitGroup struct {
-	count uint32
+	count   uint32
+	waiters uint32
 }
 
 func (wg *WaitGroup) Add(delta int) {
-	v := atomic.AddUint32(&wg.count, uint32(delta))
-	if int32(v) < 0 {
-		panic("ушли в минус")
-	}
-	if v == 0 {
-		futex.WakeAll(&wg.count)
+	for {
+		old := atomic.LoadUint32(&wg.count)
+		n := int64(old) + int64(delta)
+		if n < 0 {
+			panic("ушли в минус")
+		}
+		if n > math.MaxUint32 {
+			panic("слишком большое количество")
+		}
+		if atomic.CompareAndSwapUint32(&wg.count, old, uint32(n)) {
+			if n == 0 && atomic.LoadUint32(&wg.waiters) > 0 {
+				futex.WakeAll(&wg.count)
+			}
+			return
+		}
 	}
 }
 
 func (wg *WaitGroup) Done() {
-	// v := atomic.AddUint32(&wg.count, ^uint32(0))
-	// if int32(v) < 0 {
-	// 	panic("уход в минус")
-	// }
-	// if v == 0 { // 0xFFFFFFFF я не знаю как передать -1 если поле uint32
-	// 	futex.WakeAll(&wg.count)
-	// }
 	wg.Add(-1)
-	// по факту так и есть
-	// done это + (-1) = -1
-	// так что почему бы и нет
 }
 
 func (wg *WaitGroup) Wait() {
@@ -39,17 +41,8 @@ func (wg *WaitGroup) Wait() {
 		if count == 0 {
 			return
 		}
+		atomic.AddUint32(&wg.waiters, 1)
 		futex.Wait(&wg.count, count)
+		atomic.AddUint32(&wg.waiters, ^uint32(0))
 	}
 }
-
-// concurrency % make waitgroup
-// 04_waitgroup/waitgroup.go
-// go vet ./04_waitgroup/
-// go test ./04_waitgroup/
-// ok      primitives/04_waitgroup 0.538s
-// go test -race ./04_waitgroup/
-// ok      primitives/04_waitgroup 1.482s
-// go test -race -count=20 -timeout=10m ./04_waitgroup/
-// ok      primitives/04_waitgroup 3.912s
-// 04_waitgroup: всё зелёное

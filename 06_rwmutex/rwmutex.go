@@ -2,80 +2,95 @@ package rwmutex
 
 import (
 	"sync/atomic"
+
+	"primitives/02_mutex"
 	"primitives/internal/futex"
 )
 
-const writer = 1 << 31
-
-const readers = 1<<31 - 1 // добавил читателей тоже
+const (
+	writer         = 1 << 31            // писатель держит лок
+	writerWaiting  = 1 << 30            // писатель ждёт: новые читатели не заходят
+	readersWaiting = 1 << 29            // есть спящие читатели
+	readers        = readersWaiting - 1 // маска счётчика читателей
+)
 
 type RWMutex struct {
-	state uint32
+	state     uint32
+	writerSeq uint32
+	w         mutex.Mutex
 }
-
-// 31 писатель 
-// 0-30 читатели
 
 func (rw *RWMutex) RLock() {
 	for {
 		state := atomic.LoadUint32(&rw.state)
-		if state & writer != 0 { // если там не писатель, то засыпаем
-			futex.Wait(&rw.state, state)
-		} else { // не писатель, увеличиваем количество читателей
+		if state&(writer|writerWaiting) == 0 {
+			if state&readers == readers {
+				panic("слишком много читателей")
+			}
 			if atomic.CompareAndSwapUint32(&rw.state, state, state+1) {
 				return
 			}
+			continue
 		}
+		if state&readersWaiting == 0 {
+			if !atomic.CompareAndSwapUint32(&rw.state, state, state|readersWaiting) {
+				continue
+			}
+			state |= readersWaiting
+		}
+		futex.Wait(&rw.state, state)
 	}
 }
 
 func (rw *RWMutex) RUnlock() {
 	for {
 		state := atomic.LoadUint32(&rw.state)
-		if state & readers == 0 {
-			panic("unlock без lock крута") // 0 читателей, кого тут разблокировать?
+		if state&readers == 0 {
+			panic("unlock без lock") // 0 читателей, кого тут разблокировать?
 		}
 		if atomic.CompareAndSwapUint32(&rw.state, state, state-1) {
-			if atomic.LoadUint32(&rw.state) == 0 {
-				futex.WakeAll(&rw.state)
+			if (state-1)&readers == 0 && state&writerWaiting != 0 {
+				atomic.AddUint32(&rw.writerSeq, 1)
+				futex.Wake(&rw.writerSeq)
 			}
 			return
 		}
-	}	
+	}
 }
 
 func (rw *RWMutex) Lock() {
-	//fast
-	if atomic.CompareAndSwapUint32(&rw.state, 0, writer) {
-		return
-	}
-	// slow
-
+	rw.w.Lock()
 	for {
-		if atomic.CompareAndSwapUint32(&rw.state, 0, writer) {
-			return
-		} else {
-			state := atomic.LoadUint32(&rw.state)
-			futex.Wait(&rw.state, state)
+		seq := atomic.LoadUint32(&rw.writerSeq)
+		state := atomic.LoadUint32(&rw.state)
+		if state&readers == 0 {
+			if atomic.CompareAndSwapUint32(&rw.state, state, (state&^writerWaiting)|writer) {
+				return
+			}
+			continue
 		}
+		if state&writerWaiting == 0 {
+			if !atomic.CompareAndSwapUint32(&rw.state, state, state|writerWaiting) {
+				continue
+			}
+		}
+		futex.Wait(&rw.writerSeq, seq)
 	}
 }
 
 func (rw *RWMutex) Unlock() {
-	old := atomic.SwapUint32(&rw.state, 0)
-	if old & writer == 0 {
-		panic("анлок без лока")
+	for {
+		state := atomic.LoadUint32(&rw.state)
+		if state&writer == 0 {
+			panic("анлок без лока")
+		}
+		if !atomic.CompareAndSwapUint32(&rw.state, state, state&^(writer|readersWaiting)) {
+			continue
+		}
+		if state&readersWaiting != 0 {
+			futex.WakeAll(&rw.state)
+		}
+		rw.w.Unlock()
+		return
 	}
-	futex.WakeAll(&rw.state)
 }
-
-// hw1_concurrency % make rwmutex
-// 06_rwmutex/rwmutex.go
-// go vet ./06_rwmutex/
-// go test ./06_rwmutex/
-// ok      primitives/06_rwmutex   0.587s
-// go test -race ./06_rwmutex/
-// ok      primitives/06_rwmutex   1.681s
-// go test -race -count=20 -timeout=10m ./06_rwmutex/
-// ok      primitives/06_rwmutex   7.256s
-// 06_rwmutex: всё зелёное
