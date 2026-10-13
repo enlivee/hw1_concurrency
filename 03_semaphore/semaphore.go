@@ -17,6 +17,9 @@ func New(n int) *Semaphore {
 	if n < 0 {
 		panic("отрицательное количество разрешений")
 	}
+	if n > 1 << 32 - 1 {
+		panic("количество разрешений превышает максимум")
+	}
 	return &Semaphore{
 		permits: uint32(n),
 	}
@@ -30,7 +33,7 @@ func (s *Semaphore) Acquire() {
 	}
 }
 
-func (s *Semaphore) tryAcquire() bool {
+func (s *Semaphore) TryAcquire() bool {
 	for {
 		v := atomic.LoadUint32(&s.permits)
 		if v == 0 {
@@ -42,12 +45,16 @@ func (s *Semaphore) tryAcquire() bool {
 	}
 }
 
-func (s *Semaphore) TryAcquire() bool {
-	return s.tryAcquire()
-}
-
 func (s *Semaphore) Release() {
-	atomic.AddUint32(&s.permits, 1)
+	for {
+		v := atomic.LoadUint32(&s.permits)
+		if v == 1 << 32 - 1 {
+			panic("переполнение семафора")
+		}
+		if atomic.CompareAndSwapUint32(&s.permits, v, v+1) {
+			break
+		}
+	}
 	if atomic.LoadUint32(&s.waiters) > 0 {
 		futex.Wake(&s.permits)
 	}
