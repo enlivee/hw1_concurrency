@@ -1,8 +1,10 @@
 package mutex
 
 import (
-	"primitives/internal/futex"
+	"runtime"
 	"sync/atomic"
+
+	"primitives/internal/futex"
 )
 
 const (
@@ -11,9 +13,12 @@ const (
 	contended
 )
 
+const spinIterations = 30 
+
 type Mutex struct {
 	state uint32
 }
+
 // 0 свободен free
 // 1 занят и никто не ждет held
 // 2 занят и кто-то спит в ожидании contended
@@ -23,28 +28,22 @@ func (m *Mutex) Lock() {
 	if atomic.CompareAndSwapUint32(&m.state, free, held) {
 		return
 	}
-	// rotation iteration вращение 
-	for i := 0; i < 30; i++ {
-		if atomic.CompareAndSwapUint32(&m.state, free, held) {
+	// спин с паузой (как в спинлоке)
+	for i := 0; i < spinIterations; i++ {
+		if atomic.LoadUint32(&m.state) == free &&
+			atomic.CompareAndSwapUint32(&m.state, free, held) {
 			return
 		}
+		runtime.Gosched() // даём шанс владельцу отпустить лок
 	}
-	//slow path
-	for {
-		// снова пробуем а вдруг замок освободился
-		if atomic.CompareAndSwapUint32(&m.state, free, contended) {
-			return
-		}
-		atomic.CompareAndSwapUint32(&m.state, held, contended) // теперь есть спящие
-		futex.Wait(&m.state, contended) // парковка
-	}
+	// slow path
+	for atomic.SwapUint32(&m.state, contended) != free {
+		futex.Wait(&m.state, contended)
+	} // один свап
 }
 
 func (m *Mutex) TryLock() bool {
-	if atomic.CompareAndSwapUint32(&m.state, free, held) {
-		return true
-	}
-	return false
+	return atomic.CompareAndSwapUint32(&m.state, free, held)
 }
 
 func (m *Mutex) Unlock() {
@@ -57,13 +56,3 @@ func (m *Mutex) Unlock() {
 		futex.Wake(&m.state)
 	}
 }
-
-// 02_mutex/mutex.go
-// go vet ./02_mutex/
-// go test ./02_mutex/
-// ok      primitives/02_mutex     1.108s
-// go test -race ./02_mutex/
-// ok      primitives/02_mutex     2.041s
-// go test -race -count=20 -timeout=10m ./02_mutex/
-// ok      primitives/02_mutex     14.802s
-// 02_mutex: всё зелёное

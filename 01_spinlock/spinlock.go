@@ -1,39 +1,49 @@
 package spinlock
 
-import "sync/atomic"
+import (
+	"runtime"
+	"sync/atomic"
+)
 
 // Load() атомарное чтение из ram
-// Store() атомарная загрузка в ram
+// Store() атомарная запись в ram
 // CompareAndSwape(old, new bool) одна атомарная операция, удивительно
 // Load() + Store() с проверкой и все соединено в одно
 // Swap() типа поменять с flag на !flag с возвратом старого флага
 
-type Spinlock struct {
+const (
+	spinLimit = 16
+)
+
+// backoff - хелпер для ожидания с уступкой процессору.
+// Вынесли, чтобы менять лимит и логику в одном месте.
+func backoff() {
+	for i := 0; i < spinLimit; i++ {
+		// spin
+	}
+	runtime.Gosched()
+}
+
+type baseLock struct {
 	locked atomic.Bool // состояние: свободен (false) или занят (true)
 }
 
+type Spinlock struct {
+	baseLock
+}
+
 func (s *Spinlock) Lock() {
-	for !s.locked.CompareAndSwap(false, true) { // крутимся пока занят и не получается поменять
-										       // типа долбимся в дверь в туалет в попытках открыть
-		continue
+	for !s.locked.CompareAndSwap(false, true) {
+		backoff()
 	}
 }
 
 func (s *Spinlock) TryLock() bool {
-	if s.locked.CompareAndSwap(false, true) { // проверка на свободу и сразу замена на занято
-		return true
-	} 
-	return false
+	return s.locked.CompareAndSwap(false, true) // проверка на свободу и сразу замена на занято
 }
 
-func (s *Spinlock) Unlock() {
-	// if !s.locked.Load() { // что-то пошло не так
-	// 	panic("Unlock без Lock")
-	// } else {
-	// 	s.locked.Store(false) // ура свобода
-	// }
-
-	if !s.locked.Swap(false) {
+func (b *baseLock) Unlock() {
+	if !b.locked.Swap(false) {
 		panic("Unlock без Lock")
 	}
 }
@@ -41,47 +51,29 @@ func (s *Spinlock) Unlock() {
 // как я понял:
 // плохой спинлок отбирает. хороший: проверяет и ждет... ждет...
 
-
 type TTAS struct {
-	locked atomic.Bool
+	baseLock
 }
 
 // ну вот во втором цикле мы ожидаем пока 100% не будет свободно
-// и далее попытка блока. 
+// и далее попытка блока.
 
 func (s *TTAS) Lock() {
-	for { // вечный цикл
-		for s.locked.Load() {} // пока занято
-		if s.TryLock() { // попытка блока
-			return 
+	for {
+		for s.locked.Load() {
+			backoff()
+		}
+		// TTAS: сначала проверяем Load (не трогаем кеш-линию CAS-ом),
+		// и только если свободно — делаем CAS
+		if !s.locked.Load() && s.locked.CompareAndSwap(false, true) {
+			return
 		}
 	}
 }
 
 func (s *TTAS) TryLock() bool {
-	if s.locked.CompareAndSwap(false, true) {
-		return true
-	} 
-	return false
+	return !s.locked.Load() && s.locked.CompareAndSwap(false, true)
 }
 
-func (s *TTAS) Unlock() {
-	// if !s.locked.Load()  {
-	// 	panic("Unlock без Lock")
-	// } else {
-	// 	s.locked.Store(false)
-	// }
-	if !s.locked.Swap(false) {
-		panic("Unlock без Lock")
-	}
-}
-// concurrency % make 01_spinlock
-// 01_spinlock/spinlock.go
-// go vet ./01_spinlock/
-// go test ./01_spinlock/
-// ok      primitives/01_spinlock  0.565s
-// go test -race ./01_spinlock/
-// ok      primitives/01_spinlock  (cached)
-// go test -race -count=20 -timeout=10m ./01_spinlock/
-// ok      primitives/01_spinlock  391.880s
-// 01_spinlock: всё зелёное
+
+// Unlock() такой же, как и у Spinlock.
