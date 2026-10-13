@@ -15,19 +15,26 @@ const (
 	spinLimit = 16
 )
 
-type Spinlock struct {
+// backoff - хелпер для ожидания с уступкой процессору.
+// Вынесли, чтобы менять лимит и логику в одном месте.
+func backoff() {
+	for i := 0; i < spinLimit; i++ {
+		// spin
+	}
+	runtime.Gosched()
+}
+
+type baseLock struct {
 	locked atomic.Bool // состояние: свободен (false) или занят (true)
 }
 
+type Spinlock struct {
+	baseLock
+}
+
 func (s *Spinlock) Lock() {
-	count := 0
-	for !s.locked.CompareAndSwap(false, true) { // крутимся пока занят и не получается поменять
-		// типа долбимся в дверь в туалет в попытках открыть
-		count++
-		if count >= spinLimit {
-			runtime.Gosched() // если долго не получается, то отдаем управление планировщику
-			count = 0
-		}
+	for !s.locked.CompareAndSwap(false, true) {
+		backoff()
 	}
 }
 
@@ -35,8 +42,8 @@ func (s *Spinlock) TryLock() bool {
 	return s.locked.CompareAndSwap(false, true) // проверка на свободу и сразу замена на занято
 }
 
-func (s *Spinlock) Unlock() {
-	if !s.locked.Swap(false) {
+func (b *baseLock) Unlock() {
+	if !b.locked.Swap(false) {
 		panic("Unlock без Lock")
 	}
 }
@@ -45,34 +52,28 @@ func (s *Spinlock) Unlock() {
 // плохой спинлок отбирает. хороший: проверяет и ждет... ждет...
 
 type TTAS struct {
-	locked atomic.Bool
+	baseLock
 }
 
 // ну вот во втором цикле мы ожидаем пока 100% не будет свободно
 // и далее попытка блока.
 
 func (s *TTAS) Lock() {
-	for { // вечный цикл
-		count := 0
+	for {
 		for s.locked.Load() {
-			count++
-			if count >= spinLimit {
-				runtime.Gosched()
-				count = 0
-			}
-		} // пока занято
-		if s.TryLock() { // попытка блока
+			backoff()
+		}
+		// TTAS: сначала проверяем Load (не трогаем кеш-линию CAS-ом),
+		// и только если свободно — делаем CAS
+		if !s.locked.Load() && s.locked.CompareAndSwap(false, true) {
 			return
 		}
 	}
 }
 
 func (s *TTAS) TryLock() bool {
-	return s.locked.CompareAndSwap(false, true)
+	return !s.locked.Load() && s.locked.CompareAndSwap(false, true)
 }
 
-func (s *TTAS) Unlock() {
-	if !s.locked.Swap(false) {
-		panic("Unlock без Lock")
-	}
-}
+
+// Unlock() такой же, как и у Spinlock.
