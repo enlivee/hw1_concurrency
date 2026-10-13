@@ -7,90 +7,71 @@ import (
 	"primitives/internal/futex"
 )
 
-const (
-	writer         = 1 << 31            // писатель держит лок
-	writerWaiting  = 1 << 30            // писатель ждёт: новые читатели не заходят
-	readersWaiting = 1 << 29            // есть спящие читатели
-	readers        = readersWaiting - 1 // маска счётчика читателей
-)
+const maxReaders = 1 << 30
 
 type RWMutex struct {
-	state     uint32
-	writerSeq uint32
-	w         mutex.Mutex
+	w           mutex.Mutex
+	readerCount int32  // активные + ждущие читатели; минус maxReaders, пока писатель объявлен
+	readerWait  int32  // сколько активных читателей писатель ещё ждёт
+	readerSem   uint32 // токены для спящих читателей
+	writerSem   uint32 // токен для писателя
 }
 
-func (rw *RWMutex) RLock() {
+func semAcquire(s *uint32) {
 	for {
-		state := atomic.LoadUint32(&rw.state)
-		if state&(writer|writerWaiting) == 0 {
-			if state&readers == readers {
-				panic("слишком много читателей")
-			}
-			if atomic.CompareAndSwapUint32(&rw.state, state, state+1) {
+		v := atomic.LoadUint32(s)
+		if v > 0 {
+			if atomic.CompareAndSwapUint32(s, v, v-1) {
 				return
 			}
 			continue
 		}
-		if state&readersWaiting == 0 {
-			if !atomic.CompareAndSwapUint32(&rw.state, state, state|readersWaiting) {
-				continue
-			}
-			state |= readersWaiting
-		}
-		futex.Wait(&rw.state, state)
+		futex.Wait(s, 0) // вернётся сразу, если *s уже не 0
+	}
+}
+
+func semRelease(s *uint32, n uint32) {
+	atomic.AddUint32(s, n)
+	futex.WakeAll(s)
+}
+
+func (rw *RWMutex) RLock() {
+	if atomic.AddInt32(&rw.readerCount, 1) < 0 {
+		// писатель ждёт или держит лок; мы уже посчитаны, ждём токен
+		semAcquire(&rw.readerSem)
 	}
 }
 
 func (rw *RWMutex) RUnlock() {
-	for {
-		state := atomic.LoadUint32(&rw.state)
-		if state&readers == 0 {
-			panic("unlock без lock") // 0 читателей, кого тут разблокировать?
+	if r := atomic.AddInt32(&rw.readerCount, -1); r < 0 {
+		if r+1 == 0 || r+1 == -maxReaders {
+			panic("unlock без lock")
 		}
-		if atomic.CompareAndSwapUint32(&rw.state, state, state-1) {
-			if (state-1)&readers == 0 && state&writerWaiting != 0 {
-				atomic.AddUint32(&rw.writerSeq, 1)
-				futex.Wake(&rw.writerSeq)
-			}
-			return
+		// писатель ждёт; если мы последний из тех, кого он ждал, будим его
+		if atomic.AddInt32(&rw.readerWait, -1) == 0 {
+			semRelease(&rw.writerSem, 1)
 		}
 	}
 }
 
 func (rw *RWMutex) Lock() {
 	rw.w.Lock()
-	for {
-		seq := atomic.LoadUint32(&rw.writerSeq)
-		state := atomic.LoadUint32(&rw.state)
-		if state&readers == 0 {
-			if atomic.CompareAndSwapUint32(&rw.state, state, (state&^writerWaiting)|writer) {
-				return
-			}
-			continue
-		}
-		if state&writerWaiting == 0 {
-			if !atomic.CompareAndSwapUint32(&rw.state, state, state|writerWaiting) {
-				continue
-			}
-		}
-		futex.Wait(&rw.writerSeq, seq)
+	// объявляем себя: новые читатели теперь уходят в сон
+	r := atomic.AddInt32(&rw.readerCount, -maxReaders) + maxReaders
+	// r — активные читатели, которых надо дождаться
+	if r != 0 && atomic.AddInt32(&rw.readerWait, r) != 0 {
+		semAcquire(&rw.writerSem)
 	}
 }
 
 func (rw *RWMutex) Unlock() {
-	for {
-		state := atomic.LoadUint32(&rw.state)
-		if state&writer == 0 {
-			panic("анлок без лока")
-		}
-		if !atomic.CompareAndSwapUint32(&rw.state, state, state&^(writer|readersWaiting)) {
-			continue
-		}
-		if state&readersWaiting != 0 {
-			futex.WakeAll(&rw.state)
-		}
-		rw.w.Unlock()
-		return
+	// спящие читатели становятся активными ДО того, как мы отпустим w
+	r := atomic.AddInt32(&rw.readerCount, maxReaders)
+	if r >= maxReaders {
+		panic("анлок без лока")
 	}
+	if r > 0 {
+		semRelease(&rw.readerSem, uint32(r))
+	}
+	rw.w.Unlock()
 }
