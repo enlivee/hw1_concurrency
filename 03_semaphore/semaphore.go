@@ -1,6 +1,7 @@
 package semaphore
 
 import (
+	"math"
 	"sync/atomic"
 
 	"primitives/internal/futex"
@@ -13,11 +14,13 @@ type Semaphore struct {
 
 // >0 есть свободные разрешения
 
+const maxPermits = math.MaxUint32 // максимальное количество разрешений
+
 func New(n int) *Semaphore {
 	if n < 0 {
 		panic("отрицательное количество разрешений")
 	}
-	if n > 1 << 32 - 1 {
+	if n > maxPermits {
 		panic("количество разрешений превышает максимум")
 	}
 	return &Semaphore{
@@ -48,7 +51,7 @@ func (s *Semaphore) TryAcquire() bool {
 func (s *Semaphore) Release() {
 	for {
 		v := atomic.LoadUint32(&s.permits)
-		if v == 1 << 32 - 1 {
+		if v == maxPermits {
 			panic("переполнение семафора")
 		}
 		if atomic.CompareAndSwapUint32(&s.permits, v, v+1) {
