@@ -26,7 +26,7 @@ func New(n int) *Semaphore {
 }
 
 func (s *Semaphore) Acquire() {
-	for !s.tryAcquire() {
+	for !s.TryAcquire() {
 		atomic.AddUint32(&s.waiters, 1)
 		futex.Wait(&s.permits, 0)
 		atomic.AddUint32(&s.waiters, ^uint32(0))
