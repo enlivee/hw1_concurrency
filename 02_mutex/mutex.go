@@ -1,6 +1,7 @@
 package mutex
 
 import (
+	"runtime"
 	"sync/atomic"
 
 	"primitives/internal/futex"
@@ -11,6 +12,8 @@ const (
 	held
 	contended
 )
+
+const spinIterations = 30 
 
 type Mutex struct {
 	state uint32
@@ -25,22 +28,18 @@ func (m *Mutex) Lock() {
 	if atomic.CompareAndSwapUint32(&m.state, free, held) {
 		return
 	}
-	// спин
-	for i := 0; i < 30; i++ {
+	// спин с паузой (как в спинлоке)
+	for i := 0; i < spinIterations; i++ {
 		if atomic.LoadUint32(&m.state) == free &&
 			atomic.CompareAndSwapUint32(&m.state, free, held) {
 			return
 		}
+		runtime.Gosched() // даём шанс владельцу отпустить лок
 	}
 	// slow path
-	for {
-		// снова пробуем а вдруг замок освободился
-		if atomic.CompareAndSwapUint32(&m.state, free, contended) {
-			return
-		}
-		atomic.CompareAndSwapUint32(&m.state, held, contended) // теперь есть спящие
-		futex.Wait(&m.state, contended)                        // парковка
-	}
+	for atomic.SwapUint32(&m.state, contended) != free {
+		futex.Wait(&m.state, contended)
+	} // один свап
 }
 
 func (m *Mutex) TryLock() bool {
